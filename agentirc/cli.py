@@ -98,6 +98,7 @@ def main() -> None:
     init_parser = sub.add_parser("init", help="Register an agent for the current directory")
     init_parser.add_argument("--server", default=None, help="Server name prefix")
     init_parser.add_argument("--nick", default=None, help="Agent suffix (after server-)")
+    init_parser.add_argument("--agent", default="claude", choices=["claude", "codex"], help="Agent backend")
     init_parser.add_argument("--config", default=DEFAULT_CONFIG, help="Config file path")
 
     # -- start subcommand --------------------------------------------------
@@ -345,11 +346,22 @@ def _cmd_init(args: argparse.Namespace) -> None:
             print(f"Agent '{full_nick}' already exists in config")
             sys.exit(1)
 
-    agent = AgentConfig(
-        nick=full_nick,
-        directory=os.getcwd(),
-        channels=["#general"],
-    )
+    # Use backend-specific config for correct defaults
+    if args.agent == "codex":
+        from agentirc.clients.codex.config import AgentConfig as CodexAgentConfig
+        agent = CodexAgentConfig(
+            nick=full_nick,
+            agent="codex",
+            directory=os.getcwd(),
+            channels=["#general"],
+        )
+    else:
+        agent = AgentConfig(
+            nick=full_nick,
+            agent=args.agent,
+            directory=os.getcwd(),
+            channels=["#general"],
+        )
 
     add_agent_to_config(args.config, agent, server_name=server_name)
 
@@ -408,15 +420,30 @@ def _cmd_start(args: argparse.Namespace) -> None:
 
 async def _run_single_agent(config: DaemonConfig, agent: AgentConfig) -> None:
     """Run a single agent daemon in the foreground."""
-    from agentirc.clients.claude.daemon import AgentDaemon
+    backend = getattr(agent, "agent", "claude")
 
-    daemon = AgentDaemon(config, agent)
+    if backend == "codex":
+        from agentirc.clients.codex.daemon import CodexDaemon
+        from agentirc.clients.codex.config import (
+            DaemonConfig as CodexDaemonConfig,
+        )
+        # Re-load config through Codex module for correct supervisor defaults
+        codex_config = CodexDaemonConfig(
+            server=config.server,
+            webhooks=config.webhooks,
+            buffer_size=config.buffer_size,
+            agents=config.agents,
+        )
+        daemon = CodexDaemon(codex_config, agent)
+    else:
+        from agentirc.clients.claude.daemon import AgentDaemon
+        daemon = AgentDaemon(config, agent)
 
     stop_event = asyncio.Event()
     daemon.set_stop_event(stop_event)
 
     await daemon.start()
-    logger.info("Agent %s started", agent.nick)
+    logger.info("Agent %s started (backend=%s)", agent.nick, backend)
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
