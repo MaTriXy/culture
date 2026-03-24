@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] - 2026-03-24
+
+
+### Added
+
+- Agent Harness Specification document — defines the expected interfaces for pluggable agent backends
+- Documentation of AgentRunnerBase and SupervisorBase interface contracts (specification only, no new Python ABCs in this release)
+- IPC protocol, skill contract, and config schema reference documentation
+- Written guide for implementing new agent backends (Codex, OpenCode, custom)
+
 ## [0.4.0] - 2026-03-24
 
 
