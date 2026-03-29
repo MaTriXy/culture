@@ -131,7 +131,16 @@ class OpenCodeDaemon:
 
         # 6. Optionally start the OpenCode agent runner
         if not self.skip_opencode:
-            await self._start_agent_runner()
+            try:
+                await self._start_agent_runner()
+            except Exception:
+                logger.exception(
+                    "Failed to start agent runner for %s, scheduling retry",
+                    self.agent.nick,
+                )
+                self._agent_runner = None
+                self._crash_times.append(time.time())
+                asyncio.create_task(self._delayed_restart())
 
         # 7. Sleep scheduler background task
         self._sleep_task = asyncio.create_task(self._sleep_scheduler())
@@ -241,6 +250,8 @@ class OpenCodeDaemon:
             on_exit=self._on_agent_exit,
             on_message=self._on_agent_message,
         )
+        # Absorb the system prompt response without relaying to IRC
+        self._mention_targets.append(None)
         await self._agent_runner.start()
         logger.info("OpenCodeAgentRunner started for %s", self.agent.nick)
 
@@ -366,7 +377,15 @@ class OpenCodeDaemon:
     async def _delayed_restart(self) -> None:
         await asyncio.sleep(CRASH_RESTART_DELAY)
         if not self._circuit_open and self._transport is not None:
-            await self._start_agent_runner()
+            try:
+                await self._start_agent_runner()
+            except Exception:
+                logger.exception(
+                    "Failed to restart agent runner for %s",
+                    self.agent.nick,
+                )
+                # Record as a crash so the circuit breaker can track it
+                await self._on_agent_exit(-1)
 
     # ------------------------------------------------------------------
     # Supervisor callbacks
