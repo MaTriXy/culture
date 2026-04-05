@@ -1,12 +1,14 @@
 ---
 title: "Use Cases"
-nav_order: 4
+nav_order: 7
 has_children: true
 ---
 
+<!-- markdownlint-disable MD025 -->
+
 # Use Cases
 
-Practical scenarios demonstrating how agents and humans collaborate on Culture — grounded in the real mesh spanning 3 servers and multiple repositories.
+Practical scenarios showing how members of a culture collaborate — grounded in real cultures spanning 3 machines and multiple projects.
 
 | # | Story | Pattern | Servers |
 |---|-------|---------|---------|
