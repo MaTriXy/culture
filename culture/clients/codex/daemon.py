@@ -82,6 +82,28 @@ class CodexDaemon:
         # Background task tracking (prevent GC of fire-and-forget tasks)
         self._background_tasks: set[asyncio.Task] = set()
 
+        # IPC dispatch table — maps message type → bound handler method
+        self._ipc_dispatch: dict = {
+            "irc_send": self._ipc_irc_send,
+            "irc_read": self._ipc_irc_read,
+            "irc_join": self._ipc_irc_join,
+            "irc_part": self._ipc_irc_part,
+            "irc_channels": self._ipc_irc_channels,
+            "irc_who": self._ipc_irc_who,
+            "irc_ask": self._ipc_irc_ask,
+            "compact": self._ipc_compact,
+            "clear": self._ipc_clear,
+            "status": self._ipc_status,
+            "pause": self._ipc_pause,
+            "resume": self._ipc_resume,
+            "irc_thread_create": self._ipc_irc_thread_create,
+            "irc_thread_reply": self._ipc_irc_thread_reply,
+            "irc_threads": self._ipc_irc_threads,
+            "irc_thread_close": self._ipc_irc_thread_close,
+            "irc_thread_read": self._ipc_irc_thread_read,
+            "shutdown": self._ipc_shutdown,
+        }
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -325,9 +347,8 @@ class CodexDaemon:
             channel,
         )
 
-    async def _on_agent_message(self, msg: dict) -> None:
-        """Relay agent text to IRC and feed to supervisor."""
-        # Dequeue the relay target that corresponds to this turn
+    async def _relay_response_to_irc(self, msg: dict) -> None:
+        """Dequeue the next relay target and send agent text lines to IRC."""
         relay_target = self._mention_targets.popleft() if self._mention_targets else None
         if self._transport and relay_target:
             content = msg.get("content", [])
@@ -335,16 +356,13 @@ class CodexDaemon:
                 if item.get("type") == "text":
                     text = item["text"].strip()
                     if text:
-                        # Split long messages into IRC-friendly chunks
                         for line in text.split("\n"):
                             line = line.strip()
                             if line:
                                 await self._transport.send_privmsg(relay_target, line)
 
-        if self._supervisor:
-            await self._supervisor.observe(msg)
-
-        # Capture last assistant text for status reporting
+    async def _capture_agent_status(self, msg: dict) -> None:
+        """Capture the last assistant text for status reporting and fulfill any pending query."""
         if msg.get("type") == "assistant":
             for block in msg.get("content", []):
                 if isinstance(block, dict) and block.get("type") == "text":
@@ -359,6 +377,15 @@ class CodexDaemon:
                 self._status_query_response = self._last_activity_text
                 self._status_query_event.set()
 
+    async def _on_agent_message(self, msg: dict) -> None:
+        """Relay agent text to IRC and feed to supervisor."""
+        await self._relay_response_to_irc(msg)
+
+        if self._supervisor:
+            await self._supervisor.observe(msg)
+
+        await self._capture_agent_status(msg)
+
     def _build_system_prompt(self) -> str:
         if self.agent.system_prompt:
             return self.agent.system_prompt
@@ -370,29 +397,12 @@ class CodexDaemon:
             f"When you finish a task, share results in the appropriate channel with irc_send()."
         )
 
-    async def _on_agent_exit(self, exit_code: int) -> None:
-        """Handle agent process exit with crash recovery and circuit breaker."""
+    async def _record_crash_time(self, exit_code: int) -> None:
+        """Log a crash warning, prune the sliding window, record the new crash, fire agent_error."""
         now = time.time()
-
-        if exit_code == 0:
-            logger.info("Agent %s exited cleanly", self.agent.nick)
-            if self._webhook:
-                await self._webhook.fire(
-                    AlertEvent(
-                        event_type="agent_complete",
-                        nick=self.agent.nick,
-                        message=f"Agent {self.agent.nick} completed successfully.",
-                    )
-                )
-            return
-
-        # Non-zero exit -- record crash time and check circuit breaker
         logger.warning("Agent %s crashed with exit code %d", self.agent.nick, exit_code)
-
-        # Prune old crash times outside the window
         self._crash_times = [t for t in self._crash_times if now - t < CRASH_WINDOW_SECONDS]
         self._crash_times.append(now)
-
         if self._webhook:
             await self._webhook.fire(
                 AlertEvent(
@@ -402,6 +412,11 @@ class CodexDaemon:
                 )
             )
 
+    async def _evaluate_circuit_breaker(self) -> bool:
+        """Open the circuit breaker if crash count reached the threshold.
+
+        Returns True if the circuit was opened (caller should stop restart logic).
+        """
         if len(self._crash_times) >= MAX_CRASH_COUNT:
             self._circuit_open = True
             logger.error(
@@ -421,6 +436,25 @@ class CodexDaemon:
                         ),
                     )
                 )
+            return True
+        return False
+
+    async def _on_agent_exit(self, exit_code: int) -> None:
+        """Handle agent process exit with crash recovery and circuit breaker."""
+        if exit_code == 0:
+            logger.info("Agent %s exited cleanly", self.agent.nick)
+            if self._webhook:
+                await self._webhook.fire(
+                    AlertEvent(
+                        event_type="agent_complete",
+                        nick=self.agent.nick,
+                        message=f"Agent {self.agent.nick} completed successfully.",
+                    )
+                )
+            return
+
+        await self._record_crash_time(exit_code)
+        if await self._evaluate_circuit_breaker():
             return
 
         # Schedule restart after delay
@@ -465,71 +499,14 @@ class CodexDaemon:
     # ------------------------------------------------------------------
 
     async def _handle_ipc(self, msg: dict) -> dict:
-        """Route an IPC request to the appropriate component."""
+        """Route an IPC request to the appropriate handler."""
         req_id = msg.get("id", "")
         msg_type = msg.get("type", "")
-
         try:
-            if msg_type == "irc_send":
-                return await self._ipc_irc_send(req_id, msg)
-
-            elif msg_type == "irc_read":
-                return await self._ipc_irc_read(req_id, msg)
-
-            elif msg_type == "irc_join":
-                return await self._ipc_irc_join(req_id, msg)
-
-            elif msg_type == "irc_part":
-                return await self._ipc_irc_part(req_id, msg)
-
-            elif msg_type == "irc_channels":
-                return await self._ipc_irc_channels(req_id)
-
-            elif msg_type == "irc_who":
-                return await self._ipc_irc_who(req_id, msg)
-
-            elif msg_type == "irc_ask":
-                return await self._ipc_irc_ask(req_id, msg)
-
-            elif msg_type == "compact":
-                return await self._ipc_compact(req_id)
-
-            elif msg_type == "clear":
-                return await self._ipc_clear(req_id)
-
-            elif msg_type == "status":
-                return await self._ipc_status(req_id, msg)
-
-            elif msg_type == "pause":
-                return await self._ipc_pause(req_id)
-
-            elif msg_type == "resume":
-                return await self._ipc_resume(req_id)
-
-            elif msg_type == "irc_thread_create":
-                return await self._ipc_irc_thread_create(req_id, msg)
-
-            elif msg_type == "irc_thread_reply":
-                return await self._ipc_irc_thread_reply(req_id, msg)
-
-            elif msg_type == "irc_threads":
-                return await self._ipc_irc_threads(req_id, msg)
-
-            elif msg_type == "irc_thread_close":
-                return await self._ipc_irc_thread_close(req_id, msg)
-
-            elif msg_type == "irc_thread_read":
-                return await self._ipc_irc_thread_read(req_id, msg)
-
-            elif msg_type == "shutdown":
-                task = asyncio.create_task(self._graceful_shutdown())
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-                return make_response(req_id, ok=True)
-
-            else:
+            handler = self._ipc_dispatch.get(msg_type)
+            if handler is None:
                 return make_response(req_id, ok=False, error=f"Unknown message type: {msg_type!r}")
-
+            return await handler(req_id, msg)
         except Exception as exc:
             logger.exception("IPC handler error for type %r", msg_type)
             return make_response(req_id, ok=False, error=str(exc))
@@ -538,12 +515,12 @@ class CodexDaemon:
     # IPC sub-handlers
     # ------------------------------------------------------------------
 
-    async def _ipc_pause(self, req_id: str) -> dict:
+    async def _ipc_pause(self, req_id: str, msg: dict) -> dict:
         self._paused = True
         logger.info("Agent %s paused", self.agent.nick)
         return make_response(req_id, ok=True)
 
-    async def _ipc_resume(self, req_id: str) -> dict:
+    async def _ipc_resume(self, req_id: str, msg: dict) -> dict:
         self._paused = False
         logger.info("Agent %s resumed", self.agent.nick)
         # NOTE: Catch-up on missed messages is not yet implemented.
@@ -551,12 +528,12 @@ class CodexDaemon:
         # The agent resumes and will see new messages going forward.
         return make_response(req_id, ok=True)
 
-    async def _ipc_status(self, req_id: str, msg: dict | None = None) -> dict:
+    async def _ipc_status(self, req_id: str, msg: dict) -> dict:
         running = self._agent_runner is not None and self._agent_runner.is_running()
         turn_count = self._supervisor._turn_count if self._supervisor else 0
 
         # Determine activity description
-        query = msg.get("query", False) if msg else False
+        query = msg.get("query", False)
         description = self._describe_activity(live_query=query)
 
         # If live query requested and agent is active, ask the agent directly
@@ -723,7 +700,7 @@ class CodexDaemon:
             },
         )
 
-    async def _ipc_irc_channels(self, req_id: str) -> dict:
+    async def _ipc_irc_channels(self, req_id: str, msg: dict) -> dict:
         assert self._transport is not None
         return make_response(req_id, ok=True, data={"channels": self._transport.channels})
 
@@ -756,14 +733,20 @@ class CodexDaemon:
         # Response matching is TODO
         return make_response(req_id, ok=True)
 
-    async def _ipc_compact(self, req_id: str) -> dict:
+    async def _ipc_compact(self, req_id: str, msg: dict) -> dict:
         if self._agent_runner is None or not self._agent_runner.is_running():
             return make_response(req_id, ok=False, error="Agent runner is not running")
         await self._agent_runner.send_prompt("/compact")
         return make_response(req_id, ok=True)
 
-    async def _ipc_clear(self, req_id: str) -> dict:
+    async def _ipc_clear(self, req_id: str, msg: dict) -> dict:
         if self._agent_runner is None or not self._agent_runner.is_running():
             return make_response(req_id, ok=False, error="Agent runner is not running")
         await self._agent_runner.send_prompt("/clear")
+        return make_response(req_id, ok=True)
+
+    async def _ipc_shutdown(self, req_id: str, msg: dict) -> dict:
+        task = asyncio.create_task(self._graceful_shutdown())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
         return make_response(req_id, ok=True)
