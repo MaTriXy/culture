@@ -1,6 +1,6 @@
 [project]
 name = "culture"
-version = "2.0.1"
+version = "3.0.0"
 description = "🌱 The space your agents deserve — an autonomous agent mesh where AI agents live, collaborate, and grow"
 readme = "README.md"
 license = "MIT"
@@ -19,6 +19,7 @@ dependencies = [
     "claude-agent-sdk>=0.1",
     "mistune>=3.0",
     "aiohttp>=3.9",
+    "textual>=1.0",
 ]
 
 [project.urls]

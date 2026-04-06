@@ -18,6 +18,7 @@ Subcommands:
     culture overview [--room X] [--agent X] Show mesh overview
     culture setup [--config X] [--uninstall] Set up mesh from mesh.yaml
     culture update [--dry-run] [--skip-upgrade] Upgrade and restart mesh
+    culture console [server_name]              Interactive admin console TUI
 """
 
 from __future__ import annotations
@@ -130,6 +131,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     srv_status = server_sub.add_parser("status", help="Check server daemon status")
     srv_status.add_argument("--name", default="culture", help="Server name")
+
+    srv_default = server_sub.add_parser("default", help="Set default server")
+    srv_default.add_argument("name", help="Server name to set as default")
 
     # -- create / join subcommands -----------------------------------------
     # 'create' registers an agent definition; 'join' adds it to the mesh.
@@ -316,6 +320,20 @@ def _build_parser() -> argparse.ArgumentParser:
     bot_inspect.add_argument("name", help="Bot name")
     bot_inspect.add_argument("--config", default=DEFAULT_CONFIG, help="Config file path")
 
+    # -- console subcommand ------------------------------------------------
+    console_parser = sub.add_parser("console", help="Interactive admin console")
+    console_parser.add_argument(
+        "server_name",
+        nargs="?",
+        default=None,
+        help="Server to connect to (auto-detects if omitted)",
+    )
+    console_parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG,
+        help="Config file path",
+    )
+
     return parser
 
 
@@ -353,6 +371,7 @@ def main() -> None:
             "setup": _cmd_setup,
             "update": _cmd_update,
             "bot": _cmd_bot,
+            "console": _cmd_console,
         }
         handler = dispatch.get(args.command)
         if handler:
@@ -368,13 +387,97 @@ def main() -> None:
 
 
 # -----------------------------------------------------------------------
+# Console subcommand
+# -----------------------------------------------------------------------
+
+
+def _resolve_server(server_name: str | None) -> tuple[str, int] | None:
+    """Resolve server name and port from running servers.
+
+    Returns (server_name, port) or None if no servers are running.
+    """
+    from culture.pidfile import list_servers, read_default_server, read_port
+
+    if server_name:
+        p = read_port(server_name)
+        port = p if p else 6667
+        return server_name, port
+
+    servers = list_servers()
+    if not servers:
+        return None
+
+    if len(servers) == 1:
+        return servers[0]["name"], servers[0]["port"]
+
+    default = read_default_server()
+    if default:
+        match = [s for s in servers if s["name"] == default]
+        if match:
+            return match[0]["name"], match[0]["port"]
+
+    return servers[0]["name"], servers[0]["port"]
+
+
+def _cmd_console(args: argparse.Namespace) -> None:
+    """Launch the interactive console TUI."""
+    result = _resolve_server(args.server_name)
+    if result is None:
+        print("No culture servers running. Start one with: culture server start")
+        return
+
+    server_name, port = result
+    host = "127.0.0.1"
+
+    nick_suffix = _resolve_console_nick()
+    nick = f"{server_name}-{nick_suffix}"
+
+    from culture.console.app import ConsoleApp
+    from culture.console.client import ConsoleIRCClient
+
+    client = ConsoleIRCClient(host=host, port=port, nick=nick, mode="H")
+
+    async def run():
+        await client.connect()
+        app = ConsoleApp(irc_client=client, server_name=server_name)
+        await app.run_async()
+
+    asyncio.run(run())
+
+
+def _resolve_console_nick() -> str:
+    """Resolve the human nick: git username -> OS user -> config override."""
+    import re
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "config", "user.name"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            name = result.stdout.strip().lower()
+            name = re.sub(r"[^a-z0-9-]", "", name.replace(" ", "-"))
+            if name:
+                return name
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    import os
+
+    return os.environ.get("USER", "human")
+
+
+# -----------------------------------------------------------------------
 # Server subcommands
 # -----------------------------------------------------------------------
 
 
 def _cmd_server(args: argparse.Namespace) -> None:
     if not args.server_command:
-        print("Usage: culture server {start|stop|status}", file=sys.stderr)
+        print("Usage: culture server {start|stop|status|default}", file=sys.stderr)
         sys.exit(1)
 
     if args.server_command == "start":
@@ -383,6 +486,11 @@ def _cmd_server(args: argparse.Namespace) -> None:
         _server_stop(args)
     elif args.server_command == "status":
         _server_status(args)
+    elif args.server_command == "default":
+        from culture.pidfile import write_default_server
+
+        write_default_server(args.name)
+        print(f"Default server set to '{args.name}'")
 
 
 def _server_start(args: argparse.Namespace) -> None:
@@ -406,6 +514,11 @@ def _server_start(args: argparse.Namespace) -> None:
         print(f"Server '{args.name}' starting in foreground (PID {os.getpid()})")
         print(f"  Listening on {args.host}:{args.port}")
         print(f"  Webhook port: {args.webhook_port}")
+        # Auto-set default server if none is set
+        from culture.pidfile import read_default_server, write_default_server
+
+        if read_default_server() is None:
+            write_default_server(args.name)
         try:
             asyncio.run(_run_server(args.name, args.host, args.port, links, args.webhook_port))
         finally:
@@ -424,6 +537,11 @@ def _server_start(args: argparse.Namespace) -> None:
             print(f"Server '{args.name}' started (PID {pid})")
             print(f"  Listening on {args.host}:{args.port}")
             print(f"  Logs: {LOG_DIR}/server-{args.name}.log")
+            # Auto-set default server if none is set
+            from culture.pidfile import read_default_server, write_default_server
+
+            if read_default_server() is None:
+                write_default_server(args.name)
         else:
             print(f"Server '{args.name}' failed to start", file=sys.stderr)
             sys.exit(1)
