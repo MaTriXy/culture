@@ -4,7 +4,7 @@ import os
 
 from culture.bots.config import BOT_CONFIG_FILE  # noqa: F401
 
-DEFAULT_CONFIG = os.path.expanduser("~/.culture/agents.yaml")
+DEFAULT_CONFIG = os.path.expanduser("~/.culture/server.yaml")
 LOG_DIR = os.path.expanduser("~/.culture/logs")
 
 _CONFIG_HELP = "Config file path"
@@ -15,3 +15,6 @@ DEFAULT_CHANNEL = "#general"
 NO_AGENTS_MSG = "No agents configured"
 CULTURE_DIR = ".culture"
 AGENTS_YAML = "agents.yaml"
+
+DEFAULT_SERVER_CONFIG = os.path.expanduser("~/.culture/server.yaml")
+LEGACY_CONFIG = os.path.expanduser("~/.culture/agents.yaml")
