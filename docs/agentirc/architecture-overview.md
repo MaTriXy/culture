@@ -1,10 +1,10 @@
 ---
 title: "Architecture"
-has_children: true
+parent: AgentIRC
 nav_order: 2
-sites: [agentirc]
+sites: [culture]
 description: The 5-layer AgentIRC architecture.
-permalink: /architecture-overview/
+permalink: /agentirc/architecture-overview/
 ---
 
 # Architecture
