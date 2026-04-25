@@ -23,11 +23,13 @@ from culture.constants import (
     SYSTEM_USER_PREFIX,
 )
 from culture.protocol.message import Message
+from culture.telemetry import build_audit_record, current_traceparent
 
 logger = logging.getLogger(__name__)
 
 # Span/metric attribute keys defined once so a future rename has one edit point.
 _ATTR_EVENT_TYPE = "event.type"
+
 
 if TYPE_CHECKING:
     from culture.agentirc.client import Client
@@ -39,11 +41,12 @@ class IRCd:
     """The culture IRC server."""
 
     def __init__(self, config: ServerConfig):
-        from culture.telemetry import init_metrics, init_telemetry
+        from culture.telemetry import init_audit, init_metrics, init_telemetry
 
         self.config = config
         self.tracer = init_telemetry(config)
         self.metrics = init_metrics(config)
+        self.audit = init_audit(config, self.metrics)
         self.clients: dict[str, Client | VirtualClient] = {}  # nick -> Client
         self.channels: dict[str, Channel] = {}  # name -> Channel
         self.skills: list[Skill] = []
@@ -73,6 +76,8 @@ class IRCd:
 
         logger.info("Bootstrapping system identity...")
         self._bootstrap_system_identity()
+
+        await self.audit.start()
 
         await self.emit_event(
             Event(
@@ -223,14 +228,25 @@ class IRCd:
         self.metrics.events_emitted.add(1, {_ATTR_EVENT_TYPE: event_type_str, "origin": origin_str})
         render_started = time.perf_counter()
 
+        trace_id_hex = ""
+        span_id_hex = ""
+        tp: str | None = None
+
         # Per-call get_tracer: the `tracing_exporter` test fixture swaps the
         # global provider between tests; a cached Tracer would bind to the
         # first test's provider and stop delivering to later ones.
         with _otel_trace.get_tracer("culture.agentirc").start_as_current_span(
             "irc.event.emit", attributes=attrs
-        ):
+        ) as span:
             seq = self.next_seq()
             self._event_log.append((seq, event))
+            ctx = span.get_span_context()
+            if ctx.is_valid:
+                trace_id_hex = format(ctx.trace_id, "032x")
+                span_id_hex = format(ctx.span_id, "016x")
+            # Capture traceparent inside the span so trace_flags reflect
+            # the actual sampling decision for this span, not a hardcoded -01.
+            tp = current_traceparent()
             await self._run_skill_hooks(event)
             if not origin_tag:
                 await self._relay_to_peers(event)
@@ -239,6 +255,22 @@ class IRCd:
 
         render_ms = (time.perf_counter() - render_started) * 1000.0
         self.metrics.events_render_duration.record(render_ms, {_ATTR_EVENT_TYPE: event_type_str})
+
+        # Audit submit happens after the span exits so it doesn't sit inside
+        # the irc.event.emit span (would skew render duration). The trace_id/
+        # span_id captured inside the span point back at it for cross-pillar
+        # joins.
+        tags: dict[str, str] = {"culture.dev/traceparent": tp} if tp else {}
+        self.audit.submit(
+            build_audit_record(
+                server_name=self.config.name,
+                event=event,
+                origin_tag=origin_tag,
+                trace_id=trace_id_hex,
+                span_id=span_id_hex,
+                extra_tags=tags,
+            )
+        )
 
     _NO_SURFACE_TYPES = NO_SURFACE_EVENT_TYPES
 
@@ -395,6 +427,7 @@ class IRCd:
             if self._server:
                 self._server.close()
                 await self._server.wait_closed()
+            await self.audit.shutdown()
         finally:
             self._stopped.set()
 
